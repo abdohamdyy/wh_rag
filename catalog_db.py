@@ -3,6 +3,7 @@ from typing import Any
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2 import sql
 
 
 def _get_conn_params() -> dict[str, Any]:
@@ -109,6 +110,80 @@ def search_products(user_text: str, limit: int = 3) -> list[dict[str, Any]]:
                 """,
                 (like, like, like, like, like, limit),
             )
+            rows = cur.fetchall() or []
+            return [_clean_row(r) for r in rows]
+
+
+def search_products_by_terms(terms: list[str], limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Hybrid-friendly search:
+    - Accepts a list of keywords (Arabic/English) and returns candidates with a simple score.
+    - Does NOT require the whole user message to match as one substring.
+    """
+    cleaned_terms = []
+    for t in (terms or []):
+        tt = (t or "").strip()
+        if len(tt) < 2:
+            continue
+        cleaned_terms.append(tt)
+    cleaned_terms = cleaned_terms[:12]
+
+    if not cleaned_terms:
+        return []
+
+    # Build a score expression: sum of (col ILIKE %term%) across cols/terms.
+    cols = [
+        "(name->>'ar')",
+        "(name->>'en')",
+        "slug",
+        "sku",
+        "product_code",
+    ]
+
+    params: list[Any] = []
+    score_parts: list[sql.SQL] = []
+    where_or_parts: list[sql.SQL] = []
+
+    for term in cleaned_terms:
+        like = f"%{term}%"
+        term_match_cols: list[sql.SQL] = []
+        for col in cols:
+            # (col ILIKE %s)
+            term_match_cols.append(sql.SQL("{} ILIKE %s").format(sql.SQL(col)))
+            params.append(like)
+            # score += (col ILIKE %s)::int
+            score_parts.append(sql.SQL("({} ILIKE %s)::int").format(sql.SQL(col)))
+            params.append(like)
+        where_or_parts.append(sql.SQL("(") + sql.SQL(" OR ").join(term_match_cols) + sql.SQL(")"))
+
+    score_sql = sql.SQL(" + ").join(score_parts)
+    where_sql = sql.SQL(" OR ").join(where_or_parts)
+
+    q = sql.SQL(
+        """
+        SELECT
+            id,
+            slug,
+            sku,
+            product_code,
+            COALESCE(name->>'ar', name->>'en') AS display_name,
+            consumer_price,
+            stock_quantity,
+            main_image,
+            ({score}) AS match_score
+        FROM public.products
+        WHERE deleted_at IS NULL
+          AND ({where})
+        ORDER BY match_score DESC, id DESC
+        LIMIT %s;
+        """
+    ).format(score=score_sql, where=where_sql)
+
+    params.append(int(limit))
+
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(q, params)
             rows = cur.fetchall() or []
             return [_clean_row(r) for r in rows]
 
